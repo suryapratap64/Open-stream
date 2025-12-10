@@ -457,7 +457,7 @@ io.on("connection", (socket) => {
   });
 });
 
-app.get("*", (req: Request, res: Response) => {
+app.use((req: Request, res: Response) => {
   res.sendFile(path.join(frontendDistPath, "index.html"));
 });
 
