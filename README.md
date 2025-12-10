@@ -14,10 +14,15 @@ A simple, production-ready WebRTC video conferencing application using mediasoup
 - Type-safe implementation with TypeScript
 - Socket.IO signaling for WebRTC setup
 
+## Live Demo
+
+![App Running](./frontend/public/0kj2.png)
+
 ## Quick Start
 
 ### Prerequisites
-- Node.js 18+ 
+
+- Node.js 18+
 - npm or yarn
 
 ### Installation
@@ -88,18 +93,21 @@ Node.js Backend
 ## API Endpoints
 
 ### REST
+
 - `POST /invite/create?roomId={roomId}` - Generate invite token
 - `GET /invite/validate/{token}` - Validate invite token
 
 ### Socket.IO Events
 
 **Client → Server:**
+
 - `join` - Join room with token
 - `produce` - Send audio/video producer info
 - `consume` - Request to consume remote producer
 - `resume` - Resume suspended consumer
 
 **Server → Client:**
+
 - `peers` - List of room participants
 - `newPeer` - New participant joined
 - `newProducer` - New media stream available
@@ -153,6 +161,7 @@ npm run build:frontend
 ### Important: Vercel Limitations
 
 Mediasoup will NOT run on Vercel due to:
+
 - Missing system libraries (libsrtp, openssl, libwebrtc)
 - Network restrictions on UDP/TCP ports
 - Memory limitations for WebRTC workloads
@@ -160,12 +169,14 @@ Mediasoup will NOT run on Vercel due to:
 ### Recommended: Railway Deployment
 
 Railway (https://railway.app) supports mediasoup with:
+
 - Full system library access
 - Open UDP/TCP ports for media
 - Generous free tier
 - No serverless limitations
 
 **Steps:**
+
 1. Push to GitHub
 2. Connect Railway to repo
 3. Set environment variables
@@ -175,6 +186,7 @@ Railway (https://railway.app) supports mediasoup with:
 ### Alternative: Your Own VPS
 
 DigitalOcean, Linode, AWS EC2, or similar with:
+
 - Ubuntu/Debian base
 - Node.js installed
 - Full network access
@@ -182,21 +194,25 @@ DigitalOcean, Linode, AWS EC2, or similar with:
 ## Troubleshooting
 
 **"Missing parameter name" error on startup:**
+
 - Check server.ts catch-all route uses `app.use()` not `app.get()`
 - Verify Express middleware order is correct
 
 **No video/audio:**
+
 - Check browser permissions (camera/microphone)
 - Verify .env PUBLIC_IP matches your server
 - Check browser console for WebRTC errors
 - Ensure firewall allows UDP ports 10000-20000
 
 **Connection refused:**
+
 - Backend not running? Start with `npm run dev`
 - Check PORT in .env matches startup message
 - Verify frontend VITE_API_URL points to backend
 
 **Peer doesn't appear:**
+
 - Refresh browser page
 - Check Socket.IO connection in DevTools Network tab
 - Verify room token is valid with `/invite/validate/{token}`
@@ -216,6 +232,7 @@ MIT License - see LICENSE file for details
 ## Support
 
 For issues and questions:
+
 - GitHub Issues: https://github.com/suryapratap64/Open-stream/issues
 - Check FAQ.md for common questions
 - Review SETUP.md for detailed setup guide
