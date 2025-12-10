@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@layer base {
+  * {
+    @apply m-0 p-0 box-border;
+  }
+
+  html,
+  body,
+  #root {
+    @apply w-full h-full overflow-hidden;
+  }
+
+  body {
+    @apply bg-gray-900 text-white;
+    font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  }
+
+  button:focus,
+  button:focus-visible {
+    @apply outline-4 outline-blue-500;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold cursor-pointer transition-all duration-200 hover:bg-blue-700 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-blue-500/40;
+  }
+
+  .btn-secondary {
+    @apply px-6 py-3 bg-purple-600 text-white rounded-lg font-semibold cursor-pointer transition-all duration-200 hover:bg-purple-700;
+  }
+
+  .btn-danger {
+    @apply px-6 py-3 bg-red-500 text-white rounded-lg font-semibold cursor-pointer transition-all duration-200 hover:bg-red-600;
+  }
+
+  .btn-copy {
+    @apply px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold cursor-pointer transition-all hover:bg-blue-700 text-sm;
+  }
+
+  .video-tile {
+    @apply relative bg-black rounded-lg overflow-hidden aspect-video shadow-lg;
+  }
+
+  .video-element {
+    @apply w-full h-full object-cover bg-black;
+  }
+
+  .video-label {
+    @apply absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white px-3 py-2 text-sm font-semibold;
+  }
+}

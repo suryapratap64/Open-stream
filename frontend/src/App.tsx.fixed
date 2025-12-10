@@ -1,0 +1,514 @@
+import { useState, useEffect, useRef } from "react";
+import { io, Socket } from "socket.io-client";
+import * as mediasoupClient from "mediasoup-client";
+import "./App.css";
+
+interface Participant {
+  id: string;
+  displayName: string;
+  hasAudio: boolean;
+  hasVideo: boolean;
+}
+
+interface RemoteVideo {
+  peerId: string;
+  displayName: string;
+  stream: MediaStream;
+}
+
+function App() {
+  const [view, setView] = useState<"landing" | "room">("landing");
+  const [displayName, setDisplayName] = useState("");
+  const [roomId, setRoomId] = useState("");
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [remoteVideos, setRemoteVideos] = useState<RemoteVideo[]>([]);
+  const [inviteLink, setInviteLink] = useState("");
+  const [error, setError] = useState("");
+
+  const socketRef = useRef<Socket | null>(null);
+  const deviceRef = useRef<mediasoupClient.Device | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const sendTransportRef = useRef<mediasoupClient.SendTransport | null>(null);
+  const recvTransportRef = useRef<mediasoupClient.RecvTransport | null>(null);
+  const consumedProducersRef = useRef<Set<string>>(new Set()); // Track consumed producers
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, []);
+
+  const createRoom = async () => {
+    if (!displayName.trim()) {
+      setError("Please enter your name");
+      return;
+    }
+
+    try {
+      setError("");
+      const response = await fetch("/api/rooms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hostName: displayName }),
+      });
+
+      if (!response.ok) throw new Error("Failed to create room");
+
+      const { roomId: newRoomId, inviteLink: link } = await response.json();
+      setRoomId(newRoomId);
+      await enterRoom(newRoomId, displayName, link);
+    } catch (error) {
+      console.error("Error creating room:", error);
+      setError("Failed to create room: " + (error as Error).message);
+    }
+  };
+
+  const joinRoom = async () => {
+    if (!displayName.trim()) {
+      setError("Please enter your name");
+      return;
+    }
+    if (!roomId.trim()) {
+      setError("Please enter room ID");
+      return;
+    }
+
+    try {
+      setError("");
+      const response = await fetch(`/api/rooms/${roomId}`);
+      if (!response.ok) throw new Error("Room not found");
+
+      await enterRoom(roomId, displayName);
+    } catch (error) {
+      console.error("Error joining room:", error);
+      setError("Room not found or invalid");
+    }
+  };
+
+  const enterRoom = async (rid: string, name: string, link = "") => {
+    try {
+      setError("");
+      console.log("[ROOM] Entering room:", rid);
+
+      // Initialize Socket.IO connection
+      const socket = io(window.location.origin, {
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 5,
+      });
+
+      socketRef.current = socket;
+
+      socket.on("connect", () => {
+        console.log("[SOCKET] Connected:", socket.id);
+      });
+
+      socket.on("peerJoined", (data) => {
+        console.log("[PEER] Joined:", data);
+        updateParticipants(rid);
+      });
+
+      socket.on("peerLeft", (data) => {
+        console.log("[PEER] Left:", data.peerId);
+        removeRemoteVideo(data.peerId);
+        updateParticipants(rid);
+      });
+
+      socket.on("newProducer", async (data) => {
+        console.log("[PRODUCER] New producer:", data.producerId, data.kind);
+        // Only consume if not already consumed
+        if (!consumedProducersRef.current.has(data.producerId)) {
+          await consumeProducer(rid, data.producerId, data.producerDisplayName);
+        }
+      });
+
+      // Get local media
+      console.log("[STREAM] Requesting camera and microphone...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: { width: 1280, height: 720 },
+      });
+
+      localStreamRef.current = stream;
+
+      // Display local video
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      // Initialize mediasoup device
+      console.log("[DEVICE] Initializing...");
+      const device = new mediasoupClient.Device();
+      deviceRef.current = device;
+
+      // Join room
+      const joinRes = await new Promise<any>((resolve, reject) => {
+        socket.emit(
+          "join",
+          {
+            roomId: rid,
+            displayName: name,
+            rtpCapabilities: device.rtpCapabilities || {},
+          },
+          (res: any) => {
+            if (res.error) reject(new Error(res.error));
+            else resolve(res);
+          }
+        );
+      });
+
+      // Load device with router capabilities
+      console.log("[DEVICE] Loading...");
+      await device.load({
+        routerRtpCapabilities: joinRes.rtpCapabilitiesRouter,
+      });
+      console.log("[DEVICE] Loaded successfully");
+
+      // Create SEND transport
+      console.log("[TRANSPORT] Creating send transport...");
+      const sendTransportRes = await new Promise<any>((resolve, reject) => {
+        socket.emit("createTransport", { roomId: rid, kind: "send" }, (res: any) => {
+          if (res.error) reject(new Error(res.error));
+          else resolve(res);
+        });
+      });
+
+      const sendTransport = device.createSendTransport(sendTransportRes);
+      sendTransportRef.current = sendTransport;
+
+      // Handle DTLS connect
+      sendTransport.on(
+        "connect",
+        ({ dtlsParameters }, callback, errCallback) => {
+          socket.emit(
+            "connectTransport",
+            { roomId: rid, transportId: sendTransport.id, dtlsParameters },
+            (res: any) => {
+              if (res.error) return errCallback(res.error);
+              callback();
+            }
+          );
+        }
+      );
+
+      // Handle produce
+      sendTransport.on(
+        "produce",
+        async ({ kind, rtpParameters }, callback, errCallback) => {
+          try {
+            const res = await new Promise<any>((resolve, reject) => {
+              socket.emit(
+                "produce",
+                {
+                  roomId: rid,
+                  transportId: sendTransport.id,
+                  kind,
+                  rtpParameters,
+                },
+                (r: any) => {
+                  if (r.error) reject(r.error);
+                  else resolve(r);
+                }
+              );
+            });
+            callback({ id: res.id });
+            console.log("[PRODUCER] Produced:", kind, res.id);
+          } catch (error) {
+            console.error("[PRODUCE] Error:", error);
+            errCallback(error);
+          }
+        }
+      );
+
+      // Produce local tracks
+      for (const track of stream.getTracks()) {
+        await sendTransport.produce({ track });
+      }
+
+      // Consume existing producers
+      if (joinRes.existingProducers?.length > 0) {
+        console.log("[INIT] Consuming", joinRes.existingProducers.length, "existing producers");
+        for (const { producerId, producerDisplayName } of joinRes.existingProducers) {
+          if (!consumedProducersRef.current.has(producerId)) {
+            await consumeProducer(rid, producerId, producerDisplayName);
+          }
+        }
+      }
+
+      setInviteLink(link || `http://localhost:5173?room=${rid}`);
+      setView("room");
+      updateParticipants(rid);
+    } catch (error) {
+      console.error("Error entering room:", error);
+      setError("Failed to join room: " + (error as Error).message);
+    }
+  };
+
+  const consumeProducer = async (
+    rid: string,
+    producerId: string,
+    displayName: string
+  ) => {
+    try {
+      if (!deviceRef.current || !socketRef.current) return;
+
+      // Prevent duplicate consuming
+      if (consumedProducersRef.current.has(producerId)) {
+        console.log("[CONSUME] Already consuming", producerId);
+        return;
+      }
+
+      const device = deviceRef.current;
+      const socket = socketRef.current;
+
+      // Create RECV transport if needed
+      if (!recvTransportRef.current) {
+        console.log("[TRANSPORT] Creating recv transport...");
+        const recvTransportRes = await new Promise<any>((resolve, reject) => {
+          socket.emit("createTransport", { roomId: rid, kind: "recv" }, (res: any) => {
+            if (res.error) reject(new Error(res.error));
+            else resolve(res);
+          });
+        });
+
+        const recvTransport = device.createRecvTransport(recvTransportRes);
+        recvTransportRef.current = recvTransport;
+
+        recvTransport.on(
+          "connect",
+          ({ dtlsParameters }, callback, errCallback) => {
+            socket.emit(
+              "connectTransport",
+              { roomId: rid, transportId: recvTransport.id, dtlsParameters },
+              (res: any) => {
+                if (res.error) return errCallback(res.error);
+                callback();
+              }
+            );
+          }
+        );
+      }
+
+      // Request consumer
+      const consumeRes = await new Promise<any>((resolve, reject) => {
+        socket.emit(
+          "consume",
+          {
+            roomId: rid,
+            producerId,
+            rtpCapabilities: device.rtpCapabilities,
+          },
+          (res: any) => {
+            if (res.error) reject(res.error);
+            else resolve(res);
+          }
+        );
+      });
+
+      // Create consumer
+      const consumer = await recvTransportRef.current.consume({
+        id: consumeRes.id,
+        producerId: consumeRes.producerId,
+        kind: consumeRes.kind,
+        rtpParameters: consumeRes.rtpParameters,
+        paused: false,
+      });
+
+      // Mark as consumed
+      consumedProducersRef.current.add(producerId);
+
+      // Create media stream and display
+      const remoteStream = new MediaStream([consumer.track]);
+      setRemoteVideos((prev) => {
+        // Remove duplicates
+        const filtered = prev.filter((v) => v.peerId !== producerId);
+        return [
+          ...filtered,
+          {
+            peerId: producerId,
+            displayName,
+            stream: remoteStream,
+          },
+        ];
+      });
+
+      console.log("[CONSUMER] Created:", consumeRes.id, "for", displayName);
+    } catch (error) {
+      console.error("[ERROR] Failed to consume:", error);
+    }
+  };
+
+  const removeRemoteVideo = (peerId: string) => {
+    consumedProducersRef.current.delete(peerId);
+    setRemoteVideos((prev) => prev.filter((v) => v.peerId !== peerId));
+  };
+
+  const updateParticipants = async (rid: string) => {
+    try {
+      const response = await fetch(`/api/rooms/${rid}/participants`);
+      if (!response.ok) return;
+
+      const { participants } = await response.json();
+      setParticipants(participants);
+    } catch (error) {
+      console.error("Error updating participants:", error);
+    }
+  };
+
+  const leaveRoom = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+    }
+
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
+
+    if (sendTransportRef.current) {
+      sendTransportRef.current.close();
+    }
+
+    if (recvTransportRef.current) {
+      recvTransportRef.current.close();
+    }
+
+    consumedProducersRef.current.clear();
+    setView("landing");
+    setRoomId("");
+    setRemoteVideos([]);
+    setParticipants([]);
+  };
+
+  if (view === "landing") {
+    return (
+      <div className="landing">
+        <h1>📹 Video Conference</h1>
+        <p>Simple WebRTC video conferencing with mediasoup</p>
+
+        <div className="form-group">
+          <input
+            type="text"
+            placeholder="Your name"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            onKeyPress={(e) => e.key === "Enter" && createRoom()}
+          />
+          <button onClick={createRoom} className="btn-primary">
+            Create Room
+          </button>
+        </div>
+
+        <div className="divider">OR</div>
+
+        <div className="form-group">
+          <input
+            type="text"
+            placeholder="Room ID"
+            value={roomId}
+            onChange={(e) => setRoomId(e.target.value)}
+            onKeyPress={(e) => e.key === "Enter" && joinRoom()}
+          />
+          <button onClick={joinRoom} className="btn-secondary">
+            Join Room
+          </button>
+        </div>
+
+        {error && <p className="error">{error}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="room">
+      <div className="header">
+        <h2>Room: {roomId}</h2>
+        <button onClick={leaveRoom} className="btn-danger">
+          Leave
+        </button>
+      </div>
+
+      <div className="videos">
+        <div className="video-tile">
+          <video
+            ref={localVideoRef}
+            autoPlay
+            muted
+            playsInline
+            className="video-element"
+          />
+          <div className="video-label">{displayName} (You)</div>
+        </div>
+
+        {remoteVideos.map((remote) => (
+          <RemoteVideoTile key={remote.peerId} video={remote} />
+        ))}
+      </div>
+
+      <div className="sidebar">
+        <h3>Participants ({participants.length})</h3>
+        <ul>
+          {participants.map((p) => (
+            <li key={p.id}>
+              <span>{p.displayName}</span>
+              <span className="media-status">
+                {p.hasAudio && "🎤"} {p.hasVideo && "📹"}
+              </span>
+            </li>
+          ))}
+        </ul>
+
+        {inviteLink && (
+          <div className="invite-section">
+            <h4>Invite Link</h4>
+            <input
+              type="text"
+              value={inviteLink}
+              readOnly
+              className="invite-link"
+            />
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(inviteLink);
+                alert("Copied!");
+              }}
+              className="btn-copy"
+            >
+              Copy
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RemoteVideoTile({
+  video,
+}: {
+  video: { peerId: string; displayName: string; stream: MediaStream };
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.srcObject = video.stream;
+    }
+  }, [video.stream]);
+
+  return (
+    <div className="video-tile">
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        className="video-element"
+      />
+      <div className="video-label">{video.displayName}</div>
+    </div>
+  );
+}
+
+export default App;

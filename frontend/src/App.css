@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@layer components {
+  .btn-primary {
+    @apply px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold cursor-pointer transition-colors duration-200 hover:bg-blue-700 active:bg-blue-800;
+  }
+
+  .btn-secondary {
+    @apply px-6 py-3 bg-blue-700 text-white rounded-lg font-semibold cursor-pointer transition-colors duration-200 hover:bg-blue-800 active:bg-blue-900;
+  }
+
+  .btn-danger {
+    @apply px-6 py-3 bg-red-600 text-white rounded-lg font-semibold cursor-pointer transition-colors duration-200 hover:bg-red-700 active:bg-red-800;
+  }
+
+  .btn-copy {
+    @apply px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold cursor-pointer transition-colors duration-200 hover:bg-blue-700 text-sm;
+  }
+
+  .video-tile {
+    @apply relative bg-black rounded-lg overflow-hidden aspect-video shadow-lg border border-gray-700;
+  }
+
+  .video-element {
+    @apply w-full h-full object-cover bg-black;
+  }
+
+  .video-label {
+    @apply absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black to-transparent text-white px-3 py-2 text-sm font-semibold;
+  }
+}
+
+html,
+body,
+#root {
+  @apply h-screen overflow-hidden;
+}
+
+body {
+  @apply bg-gray-900 font-sans;
+}

@@ -1,0 +1,39 @@
+{
+  "name": "mediasoup-core",
+  "version": "1.0.0",
+  "main": "dist/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "ts-node --transpile-only server.ts",
+    "build": "tsc && cd frontend && npm run build",
+    "build:backend": "tsc",
+    "build:frontend": "cd frontend && npm run build",
+    "start": "node dist/server.js",
+    "vercel-build": "npm run build:backend && npm run build:frontend",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mediasoup": "^3.19.13",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^24.10.2",
+    "@types/socket.io": "^3.0.1",
+    "mediasoup-client": "^3.18.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
