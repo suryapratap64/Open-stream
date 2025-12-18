@@ -1,11 +1,15 @@
 import { RtpCapabilities } from "mediasoup/node/lib/types";
 
+export type PeerRole = "host" | "producer" | "consumer";
+
 export interface Peer {
-  id: string; // socket id
+  id: string;
+  userId: string; // Persistent user ID across tabs
   displayName: string;
+  role: PeerRole; // Role-based permissions
   rtcMinPort?: number;
   rtcMaxPort?: number;
-  sendTransport?: any; // ONE send transport
+  sendTransport?: any;
   recvTransport?: any; // ONE recv transport (reused for all consumers)
   producers: Map<string, any>;
   consumers: Map<string, any>;

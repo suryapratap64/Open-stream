@@ -46,11 +46,21 @@ app.post("/api/rooms", async (req: Request, res: Response) => {
   try {
     const { hostName = "Host" } = req.body;
     const roomId = `room-${Date.now()}`;
-    const inviteLink = inviteManager.generateInviteLink(roomId);
+    // Pre-create a room session and invite token so the invite link
+    // returned here is valid before the host actually connects.
+    const { inviteToken } = inviteManager.createRoomSession(
+      roomId,
+      "",
+      hostName
+    );
+
+    const baseUrl = req.protocol + "://" + req.get("host");
+    const inviteLink = inviteManager.generateInviteLink(roomId, baseUrl);
 
     res.json({
       roomId,
       inviteLink,
+      inviteToken,
       hostName,
     });
   } catch (error) {
@@ -93,6 +103,7 @@ app.get("/api/rooms/:roomId/participants", (req: Request, res: Response) => {
     const participants = Array.from(room.peers.values()).map((peer) => ({
       id: peer.id,
       displayName: peer.displayName,
+      role: peer.role,
       hasAudio: Array.from(peer.producers.values()).some(
         (p) => p.kind === "audio"
       ),
@@ -116,6 +127,7 @@ io.on("connection", (socket) => {
     async (
       data: {
         roomId: string;
+        userId: string;
         displayName: string;
         rtpCapabilities: any;
         inviteToken?: string;
@@ -123,44 +135,122 @@ io.on("connection", (socket) => {
       callback
     ) => {
       try {
-        const { roomId, displayName, rtpCapabilities, inviteToken } = data;
+        const { roomId, userId, displayName, rtpCapabilities, inviteToken } =
+          data;
 
+        console.log(
+          `[JOIN] User ${displayName} (${userId}) attempting to join ${roomId}${
+            inviteToken ? " with invite token" : " without token"
+          }`
+        );
+
+        // Verify invite token if provided
         if (inviteToken) {
           const validation = inviteManager.verifyInviteToken(inviteToken);
           if (!validation.valid || validation.roomId !== roomId) {
-            return callback({ error: "Invalid invite token" });
+            console.log(`[JOIN] Invalid token for room ${roomId}`);
+            return callback({ error: "Invalid or expired invite token" });
           }
+          console.log(`[JOIN] Token validated for ${roomId}`);
         }
 
         const room = await ensureRoom(roomId, socket.id, displayName);
-        room.addPeer(socket.id, displayName);
+
+        // Check if same user already in room (same tab scenario)
+        const existingPeer = room.getPeerByUserId(userId);
+        if (existingPeer && existingPeer.id !== socket.id) {
+          console.log(
+            `[ROOM ${roomId}] User ${userId} already in room from ${existingPeer.id}`
+          );
+        }
+
+        // Determine role based on context
+        // First user creating room -> host
+        // Otherwise new participants are 'waiting' by default
+        // Host must explicitly approve their join (promote to 'consumer')
+        let role: "host" | "producer" | "consumer" | "waiting" = "waiting";
+
+        if (room.getPeerCount() === 0) {
+          role = "host";
+          console.log(
+            `[JOIN] ${displayName} is FIRST peer - assigning HOST role`
+          );
+        } else {
+          console.log(`
+            [JOIN] ${displayName} joining room - assigning WAITING role
+          `);
+        }
+
+        // Add peer with appropriate role
+        room.addPeer(socket.id, userId, displayName, role);
         const peer = room.getPeer(socket.id);
-        peer!.rtpCapabilities = rtpCapabilities;
+        if (!peer) {
+          console.error(`[JOIN] Failed to add peer ${socket.id}`);
+          return callback({ error: "Failed to add peer to room" });
+        }
+        peer.rtpCapabilities = rtpCapabilities;
 
         socket.join(roomId);
 
+        // Notify others about new peer
         socket.to(roomId).emit("peerJoined", {
           peerId: socket.id,
+          userId,
           displayName,
+          role,
         });
 
-        // Send ALL producers (both audio and video) to new peer
-        const allProducers = room.getAllProducersForPeer(socket.id);
+        // Do NOT create transports for waiting peers. Hosts/producers
+        // will request them when needed. Clients in 'waiting' state
+        // must be approved by host before receiving media.
+
+        // Send ALL producers to new peer only if they are allowed to consume
+        const allProducers =
+          role === "waiting" ? [] : room.getAllProducersForPeer(socket.id);
 
         callback({
           rtpCapabilitiesRouter: room.getRtpCapabilities(),
           existingProducers: allProducers,
           participants: Array.from(room.peers.values()).map((p) => ({
             id: p.id,
+            userId: p.userId,
             displayName: p.displayName,
+            role: p.role,
           })),
+          yourRole: role,
+          yourSocketId: socket.id,
         });
 
         console.log(
-          `[ROOM ${roomId}] ${displayName} joined (total: ${room.getPeerCount()}), sending ${
-            allProducers.length
-          } existing producers`
+          `[ROOM ${roomId}] ${displayName} joined as ${role} (total: ${room.getPeerCount()})`
         );
+
+        // If peer is waiting, notify host for approval
+        if (role === "waiting") {
+          const host = Array.from(room.peers.values()).find(
+            (p) => p.role === "host" || p.id === room.hostSocketId
+          );
+          if (host) {
+            const joinRequestData = {
+              peerId: socket.id,
+              userId,
+              displayName,
+              message: `${displayName} requests to join`,
+            };
+            console.log(
+              "[JOIN] Emitting joinRequest to host",
+              host.id,
+              "with data:",
+              JSON.stringify(joinRequestData)
+            );
+            io.to(host.id).emit("joinRequest", joinRequestData);
+          } else {
+            console.warn(
+              "[JOIN] No host found to send join request to for room:",
+              roomId
+            );
+          }
+        }
       } catch (error) {
         console.error("[JOIN] Error:", error);
         callback({ error: "Failed to join room" });
@@ -182,6 +272,24 @@ io.on("connection", (socket) => {
         const peer = room.getPeer(socket.id);
         if (!peer) {
           return callback({ error: "Peer not found" });
+        }
+
+        // Permission check: only producers and hosts can request send transport
+        if (kind === "send" && !room.canPeerProduce(socket.id)) {
+          return callback({
+            error:
+              "Permission denied: You do not have permission to produce media. Wait for host approval.",
+          });
+        }
+
+        // Waiting peers cannot create recv transports either
+        if (kind === "recv") {
+          const peer = room.getPeer(socket.id);
+          if (peer && peer.role === "waiting") {
+            return callback({
+              error: "Permission denied: waiting for host approval.",
+            });
+          }
         }
 
         let transport;
@@ -210,7 +318,7 @@ io.on("connection", (socket) => {
         console.log(
           `[TRANSPORT] ${kind.toUpperCase()} transport ${transport.id} for ${
             socket.id
-          }`
+          } (role: ${peer.role})`
         );
       } catch (error) {
         console.error("[CREATE_TRANSPORT] Error:", error);
@@ -282,6 +390,14 @@ io.on("connection", (socket) => {
           return callback({ error: "Peer not found" });
         }
 
+        // CRITICAL: Verify peer has permission to produce
+        if (!room.canPeerProduce(socket.id)) {
+          return callback({
+            error:
+              "Permission denied: You do not have permission to produce media",
+          });
+        }
+
         const transport = peer.sendTransport;
         if (!transport || transport.id !== transportId) {
           return callback({ error: "Send transport not found" });
@@ -301,7 +417,7 @@ io.on("connection", (socket) => {
         callback({ id: producer.id });
 
         console.log(
-          `[PRODUCE] ${socket.id} produced ${kind} in room ${roomId}`
+          `[PRODUCE] ${socket.id} (${peer.role}) produced ${kind} in room ${roomId}`
         );
       } catch (error) {
         console.error("[PRODUCE] Error:", error);
@@ -396,6 +512,270 @@ io.on("connection", (socket) => {
       } catch (error) {
         console.error("[RESUME_CONSUMER] Error:", error);
         callback({ error: "Failed to resume consumer" });
+      }
+    }
+  );
+
+  /**
+   * Promote consumer to producer
+   * Host-only action
+   */
+  socket.on(
+    "promoteToProducer",
+    async (data: { roomId: string; peerId: string }, callback) => {
+      try {
+        const { roomId, peerId } = data;
+        const room = rooms.get(roomId);
+
+        if (!room) {
+          return callback({ error: "Room not found" });
+        }
+
+        // Only host can promote
+        if (!room.isHost(socket.id)) {
+          return callback({ error: "Only host can approve permissions" });
+        }
+
+        const targetPeer = room.getPeer(peerId);
+        if (!targetPeer) {
+          return callback({ error: "Peer not found" });
+        }
+
+        // Promote peer to producer
+        const success = room.promotePeerToProducer(peerId);
+        if (!success) {
+          return callback({ error: "Peer is already a producer or host" });
+        }
+
+        // Notify target peer of promotion
+        io.to(peerId).emit("promotedToProducer", {
+          message: "You have been approved to speak",
+        });
+
+        // Notify room
+        socket.to(roomId).emit("peerPromoted", {
+          peerId,
+          displayName: targetPeer.displayName,
+          role: "producer",
+        });
+
+        callback({ promoted: true });
+
+        console.log(
+          `[PERMISSION] ${socket.id} promoted ${peerId} to producer in ${roomId}`
+        );
+      } catch (error) {
+        console.error("[PROMOTE_TO_PRODUCER] Error:", error);
+        callback({ error: "Failed to promote peer" });
+      }
+    }
+  );
+
+  /**
+   * Approve waiting peer to become consumer (allow them to consume media)
+   * Host-only action
+   */
+  socket.on(
+    "approveJoin",
+    async (
+      data: { roomId: string; peerId: string; promote?: boolean },
+      callback
+    ) => {
+      try {
+        const { roomId, peerId } = data;
+        console.log("[APPROVE_JOIN] Received:", {
+          roomId,
+          peerId,
+          promote: (data as any).promote,
+        });
+        const room = rooms.get(roomId);
+
+        if (!room) {
+          console.error("[APPROVE_JOIN] Room not found:", roomId);
+          return callback({ error: "Room not found" });
+        }
+
+        console.log(
+          "[APPROVE_JOIN] Checking host privilege for socket:",
+          socket.id
+        );
+        if (!room.isHost(socket.id)) {
+          console.error(
+            "[APPROVE_JOIN] Only host can approve, but requester is:",
+            socket.id
+          );
+          return callback({ error: "Only host can approve joining" });
+        }
+
+        const targetPeer = room.getPeer(peerId);
+        if (!targetPeer) {
+          console.error("[APPROVE_JOIN] Peer not found:", peerId);
+          return callback({ error: "Peer not found" });
+        }
+
+        console.log(
+          "[APPROVE_JOIN] Target peer found:",
+          targetPeer.displayName,
+          "current role:",
+          targetPeer.role
+        );
+
+        const success = room.approvePeerJoin(peerId);
+        if (!success) {
+          console.error("[APPROVE_JOIN] Peer is not in waiting state:", peerId);
+          return callback({ error: "Peer is not waiting" });
+        }
+
+        console.log(
+          "[APPROVE_JOIN] Peer approved to join, role changed to consumer"
+        );
+
+        // If host requested, also promote to producer (single-step admit+allow)
+        const promote = !!(data as any).promote;
+        if (promote) {
+          room.promotePeerToProducer(peerId);
+          console.log("[APPROVE_JOIN] Peer promoted to producer:", peerId);
+        }
+
+        // Notify the target peer that they are approved and include producers to consume
+        const existingProducers = room.getAllProducersForPeer(peerId);
+        const rtpCaps = room.getRtpCapabilities();
+        console.log(
+          "[APPROVE_JOIN] Emitting joinApproved to",
+          peerId,
+          "with producers:",
+          existingProducers.length,
+          "promote:",
+          promote
+        );
+        io.to(peerId).emit("joinApproved", {
+          message: "You are approved to join",
+          promote,
+          existingProducers,
+          rtpCapabilitiesRouter: rtpCaps,
+        });
+
+        // Notify others about role change
+        socket.to(roomId).emit("peerApproved", {
+          peerId,
+          displayName: targetPeer.displayName,
+          role: promote ? "producer" : "consumer",
+        });
+
+        console.log("[APPROVE_JOIN] Calling callback with success");
+        callback({ approved: true, promoted: promote });
+
+        console.log(
+          `[PERMISSION] ${socket.id} approved ${peerId} to join ${roomId} (promote=${promote})`
+        );
+      } catch (error) {
+        console.error("[APPROVE_JOIN] Error:", error);
+        callback({ error: "Failed to approve join" });
+      }
+    }
+  );
+
+  /**
+   * Demote producer to consumer
+   * Host-only action (revoke permissions)
+   */
+  socket.on(
+    "demoteToConsumer",
+    async (data: { roomId: string; peerId: string }, callback) => {
+      try {
+        const { roomId, peerId } = data;
+        const room = rooms.get(roomId);
+
+        if (!room) {
+          return callback({ error: "Room not found" });
+        }
+
+        // Only host can demote
+        if (!room.isHost(socket.id)) {
+          return callback({ error: "Only host can revoke permissions" });
+        }
+
+        const targetPeer = room.getPeer(peerId);
+        if (!targetPeer) {
+          return callback({ error: "Peer not found" });
+        }
+
+        // Don't demote host
+        if (targetPeer.role === "host") {
+          return callback({ error: "Cannot demote host" });
+        }
+
+        // Demote peer to consumer
+        room.demotePeerToConsumer(peerId);
+
+        // Notify target peer
+        io.to(peerId).emit("demotedToConsumer", {
+          message: "Your speaking permission has been revoked",
+        });
+
+        // Notify room
+        socket.to(roomId).emit("peerDemoted", {
+          peerId,
+          displayName: targetPeer.displayName,
+          role: "consumer",
+        });
+
+        callback({ demoted: true });
+
+        console.log(
+          `[PERMISSION] ${socket.id} demoted ${peerId} to consumer in ${roomId}`
+        );
+      } catch (error) {
+        console.error("[DEMOTE_TO_CONSUMER] Error:", error);
+        callback({ error: "Failed to demote peer" });
+      }
+    }
+  );
+
+  /**
+   * Request speaking permission
+   * Consumer can request to become producer
+   */
+  socket.on(
+    "requestSpeakingPermission",
+    async (data: { roomId: string }, callback) => {
+      try {
+        const { roomId } = data;
+        const room = rooms.get(roomId);
+
+        if (!room) {
+          return callback({ error: "Room not found" });
+        }
+
+        const peer = room.getPeer(socket.id);
+        if (!peer) {
+          return callback({ error: "Peer not found" });
+        }
+
+        if (peer.role === "producer" || peer.role === "host") {
+          return callback({ error: "Already have speaking permission" });
+        }
+
+        // Notify host
+        const host = Array.from(room.peers.values()).find(
+          (p) => p.role === "host" || p.id === room.hostSocketId
+        );
+        if (host) {
+          io.to(host.id).emit("speakingPermissionRequest", {
+            peerId: socket.id,
+            userId: peer.userId,
+            displayName: peer.displayName,
+          });
+        }
+
+        callback({ requested: true });
+
+        console.log(
+          `[PERMISSION] ${peer.displayName} requested speaking permission in ${roomId}`
+        );
+      } catch (error) {
+        console.error("[REQUEST_SPEAKING_PERMISSION] Error:", error);
+        callback({ error: "Failed to request permission" });
       }
     }
   );

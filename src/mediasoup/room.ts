@@ -9,7 +9,7 @@ import {
 import { mediasoupService } from "./mediasoupService";
 import type { Worker } from "mediasoup/node/lib/WorkerTypes";
 import { v4 as uuidv4 } from "uuid";
-import type { Peer } from "../types/index";
+import type { Peer, PeerRole } from "../types/index";
 
 export class Room {
   id: string;
@@ -57,10 +57,23 @@ export class Room {
     return this.router.rtpCapabilities;
   }
 
-  addPeer(socketId: string, displayName: string = "Anonymous") {
+  /**
+   * Add peer to room with specified role
+   * Host: Full permissions (produce, consume, approve others)
+   * Producer: Can produce and consume media
+   * Consumer: Can only consume media (default for invited users)
+   */
+  addPeer(
+    socketId: string,
+    userId: string,
+    displayName: string = "Anonymous",
+    role: PeerRole = "consumer"
+  ) {
     const peer: Peer = {
       id: socketId,
+      userId,
       displayName,
+      role,
       producers: new Map(),
       consumers: new Map(),
     };
@@ -70,6 +83,88 @@ export class Room {
 
   getPeer(socketId: string) {
     return this.peers.get(socketId);
+  }
+
+  /**
+   * Get peer by userId (useful for checking if same user already in room)
+   */
+  getPeerByUserId(userId: string) {
+    for (const peer of this.peers.values()) {
+      if (peer.userId === userId) {
+        return peer;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Promote peer from consumer to producer
+   * Host-controlled action
+   */
+  promotePeerToProducer(peerId: string): boolean {
+    const peer = this.peers.get(peerId);
+    if (!peer) return false;
+
+    if (peer.role === "consumer") {
+      peer.role = "producer";
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Approve a waiting peer to become a consumer (allow join to start consuming)
+   */
+  approvePeerJoin(peerId: string): boolean {
+    const peer = this.peers.get(peerId);
+    if (!peer) return false;
+
+    if (peer.role === "waiting") {
+      peer.role = "consumer";
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Demote peer from producer to consumer
+   * Host-controlled action (revoke permission)
+   */
+  demotePeerToConsumer(peerId: string): void {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+
+    peer.role = "consumer";
+
+    // Close send transport if exists
+    if (peer.sendTransport) {
+      peer.sendTransport.close();
+      peer.sendTransport = undefined;
+    }
+
+    // Close all producers (clean media streams)
+    for (const producer of peer.producers.values()) {
+      producer.close();
+    }
+    peer.producers.clear();
+  }
+
+  /**
+   * Check if peer can produce media based on role
+   */
+  canPeerProduce(peerId: string): boolean {
+    const peer = this.peers.get(peerId);
+    if (!peer) return false;
+    return peer.role === "producer" || peer.role === "host";
+  }
+
+  /**
+   * Check if peer is the host
+   */
+  isHost(peerId: string): boolean {
+    const peer = this.peers.get(peerId);
+    if (!peer) return false;
+    return peer.role === "host" || peerId === this.hostSocketId;
   }
 
   removePeer(socketId: string) {
